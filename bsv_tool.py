@@ -219,8 +219,7 @@ class BaseBSVReader:
         for _ in range(self.row_count):
             self.offset, data = parser.parse(self.buffer, self.offset)
             
-            # this is here to just get the correct name
-            # TODO: why is 40 40 11 11 12 21 08 missing? And what does "81 21 10 06" supposed to mean?
+            # \x21\x08 got treated wrongly
             clean_name = strip_name_prefix(data['name'])
             data['hname'] = calculate_hname(data['checksum'], data['size'], clean_name)
             
@@ -379,4 +378,5 @@ def main():
         exit(1)
 
 if __name__ == '__main__':
+
     main()
