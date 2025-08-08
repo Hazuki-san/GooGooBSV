@@ -10,26 +10,18 @@ from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple, Dict, Any
 
 # ==============================================================================
-# 1. Manifest Data Structures
+# Manifest Data Structures & Schema
 # ==============================================================================
 
-# A mapping of Line Handlers to their binary schema definition.
-# This is used when writing BSV files with the "schema" format.
 SCHEMA_DEFINITIONS = {
     'FullLineHandler': {
-        'version': 16,
-        'count': 6,
-        'data': b'\x40\x40\x11\x11\x12\x21\x08'  # name, deps, group, priority, size, checksum
+        'version': 16, 'count': 6, 'data': b'\x40\x40\x11\x11\x12\x21\x08'
     },
     'LegacyFullLineHandler': {
-        'version': 16,
-        'count': 5,
-        'data': b'\x40\x40\x11\x12\x21\x08'  # name, deps, group, size, checksum
+        'version': 16, 'count': 5, 'data': b'\x40\x40\x11\x12\x21\x08'
     },
     'SimplifiedLineHandler': {
-        'version': 16,
-        'count': 3,
-        'data': b'\x40\x12\x21\x08'  # name, size, checksum
+        'version': 16, 'count': 3, 'data': b'\x40\x12\x21\x08'
     }
 }
 
@@ -75,6 +67,8 @@ class ManifestEntry:
 # 2. H-Name and Checksum Calculation
 # ==============================================================================
 
+# Python misunderstood this sometimes, so I just did this.
+# Works for me, works for everyone...
 PREFIX_TO_STRIP = b'\x21\x08'
 
 def strip_name_prefix(name: bytes) -> bytes:
@@ -214,18 +208,12 @@ class BaseBSVReader:
         self.row_count = 0
 
     def read_all_entries(self, parser: BaseLineHandler) -> List[ManifestEntry]:
-        """Reads all rows and correctly handles name prefixes for hname calculation."""
         entries = []
         for _ in range(self.row_count):
             self.offset, data = parser.parse(self.buffer, self.offset)
-            
-            # \x21\x08 got treated wrongly
             clean_name = strip_name_prefix(data['name'])
-            data['hname'] = calculate_hname(data['checksum'], data['size'], clean_name)
-            
-            # Store the clean name in the final entry object to match the database representation.
+            data['hname'] = calculate_hname(data.get('checksum', 0), data.get('size', 0), clean_name)
             data['name'] = clean_name
-            
             entries.append(ManifestEntry(**data))
         return entries
 
@@ -233,17 +221,27 @@ class AprioriBSVReader(BaseBSVReader):
     def __init__(self, buffer: bytes, start_offset: int):
         super().__init__(buffer, start_offset)
         self.offset, self.row_count = read_vlq(self.buffer, self.offset)
-        self.offset, _ = read_vlq(self.buffer, self.offset) # max_row_size
-        print(f"INFO: Apriori Reader initialized. Rows: {self.row_count}")
+        self.offset, _ = read_vlq(self.buffer, self.offset)
+        print("INFO: Apriori Reader initialized. Rows: {self.row_count}")
 
 class AnonymousSchemaBSVReader(BaseBSVReader):
     def __init__(self, buffer: bytes, start_offset: int):
         super().__init__(buffer, start_offset)
-        self.offset, header_size = read_unum(self.buffer, self.offset, 2)
+        self.schema_count = 0
+        self.schema_version = 0
+        
+        self.offset, _ = read_unum(self.buffer, self.offset, 2)
         self.offset, self.row_count = read_vlq(self.buffer, self.offset)
-        # The actual data starts after the full header, so we jump the offset there.
-        self.offset = start_offset + header_size
-        print(f"INFO: AnonymousSchema Reader initialized. Rows: {self.row_count}")
+        self.offset, _ = read_vlq(self.buffer, self.offset)
+        self.offset, self.schema_version = read_vlq(self.buffer, self.offset)
+        self.offset, self.schema_count = read_vlq(self.buffer, self.offset)
+        
+        for _ in range(self.schema_count):
+            self.offset, schema_type = read_unum(self.buffer, self.offset, 1)
+            if ((schema_type - 33) & 0xCF) == 0 and schema_type != 81:
+                self.offset, _ = read_vlq(self.buffer, self.offset)
+        
+        print(f"INFO: AnonymousSchema Reader initialized. Rows: {self.row_count}, Schema Columns: {self.schema_count}.")
 
 def init_bsv_reader(filepath: str) -> BaseBSVReader:
     try:
@@ -264,24 +262,40 @@ def init_bsv_reader(filepath: str) -> BaseBSVReader:
 # 6. High-Level API & Main Logic
 # ==============================================================================
 
-def read_manifest(filepath: str, format_type: str = 'full') -> List[ManifestEntry]:
+def read_manifest(filepath: str, format_type: str = 'auto') -> List[ManifestEntry]:
+    """
+    High-level function to read a manifest. If format_type is 'auto', it will
+    inspect the BSV header to determine the correct parser to use.
+    """
     reader = init_bsv_reader(filepath)
-    parser: BaseLineHandler
+    
+    if format_type == 'auto':
+        print("INFO: Auto-detecting format...")
+        if isinstance(reader, AnonymousSchemaBSVReader):
+            if reader.schema_count == 3:
+                format_type = 'simplified'
+                print("INFO: Detected 3 schema columns -> 'simplified' format.")
+            else:
+                format_type = 'full'
+                print(f"INFO: Detected {reader.schema_count} schema columns -> 'full' format.")
+        else:
+            format_type = 'legacy'
+            print("INFO: Apriori BSV detected -> 'legacy' format.")
+
     if format_type == 'simplified':
         parser = SimplifiedLineHandler()
-    elif isinstance(reader, AprioriBSVReader):
+    elif format_type == 'legacy':
         parser = LegacyFullLineHandler()
-    else:
+    else: # 'full'
         parser = FullLineHandler()
+        
     return reader.read_all_entries(parser)
 
 def write_manifest(output_path: str, entries: List[ManifestEntry], line_handler: BaseLineHandler, bsv_format: str = 'schema'):
     print(f"INFO: Preparing to write {len(entries)} entries to '{output_path}'")
     
-    # Serialize all rows first to calculate body size and max_row_size
     if not entries:
-        serialized_rows = []
-        max_row_size = 0
+        serialized_rows, max_row_size = [], 0
     else:
         serialized_rows = [line_handler.serialize(entry) for entry in entries]
         max_row_size = max(len(row) for row in serialized_rows)
@@ -290,40 +304,35 @@ def write_manifest(output_path: str, entries: List[ManifestEntry], line_handler:
     
     header_bytes = b''
     if bsv_format == 'apriori':
-        header_bytes = b'\xBF\x10' # Magic + Version 1, Format 0
-        header_bytes += write_vlq(len(entries)) # row_count
-        header_bytes += write_vlq(max_row_size) # max_row_size
+        header_bytes = b'\xBF\x10'
+        header_bytes += write_vlq(len(entries))
+        header_bytes += write_vlq(max_row_size)
     elif bsv_format == 'schema':
         header_body = bytearray()
-        header_body += write_vlq(len(entries)) # row_count
-        header_body += write_vlq(max_row_size) # max_row_size
+        header_body += write_vlq(len(entries))
+        header_body += write_vlq(max_row_size)
         
-        # Look up schema definition based on the line handler being used
         handler_name = type(line_handler).__name__
         schema_info = SCHEMA_DEFINITIONS.get(handler_name)
         
         if schema_info:
             print(f"INFO: Found schema for {handler_name}. Writing full schema header.")
-            header_body += write_vlq(schema_info['version']) # schema_version
-            header_body += write_vlq(schema_info['count'])   # schema_count
-            header_body += schema_info['data']               # schema_data
+            header_body += write_vlq(schema_info['version'])
+            header_body += write_vlq(schema_info['count'])
+            header_body += schema_info['data']
         else:
             print(f"WARNING: No schema definition for {handler_name}. Writing minimal header.")
-            header_body += write_vlq(1) # schema_version (fallback)
-            header_body += write_vlq(0) # schema_count (empty schema)
+            header_body += write_vlq(1)
+            header_body += write_vlq(0)
         
-        header_bytes = b'\xBF\x11' # Magic + Version 1, Format 1
-        header_bytes += write_unum(len(header_body), 2) # header_size
+        header_bytes = b'\xBF\x11'
+        header_bytes += write_unum(len(header_body), 2)
         header_bytes += header_body
     else:
         raise ValueError(f"Unknown BSV format for writing: {bsv_format}")
 
     final_buffer = header_bytes + body_bytes
-    print(f"INFO: Uncompressed size: {len(final_buffer)} bytes")
-    
     compressed_buffer = lz4.frame.compress(final_buffer)
-    print(f"INFO: Compressed size: {len(compressed_buffer)} bytes")
-
     with open(output_path, 'wb') as f_out:
         f_out.write(compressed_buffer)
 
@@ -331,13 +340,11 @@ def main():
     parser = argparse.ArgumentParser(description="A tool to read and write Umamusume BSV manifest files.", formatter_class=argparse.RawTextHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # --- Read Command ---
     p_read = subparsers.add_parser("read", help="Read a BSV manifest and convert to JSON.")
     p_read.add_argument("filepath", help="Path to the compressed manifest file.")
     p_read.add_argument("-o", "--output", help="Path to save the output JSON file.")
-    p_read.add_argument("-f", "--format", choices=['full', 'simplified'], default='full', help="The manifest format type to parse.")
+    p_read.add_argument("-f", "--format", choices=['auto', 'full', 'simplified'], default='auto', help="The manifest format type to parse. 'auto' is recommended.")
     
-    # --- Write Command ---
     p_write = subparsers.add_parser("write", help="Write a new BSV manifest from a JSON file.")
     p_write.add_argument("input_json", help="Path to the input JSON file.")
     p_write.add_argument("output_path", help="Path to write the new compressed manifest file.")
@@ -363,7 +370,6 @@ def main():
             
             entries = [ManifestEntry.from_dict(item) for item in data]
             
-            # Recalculate hname for all entries to ensure they are correct
             for entry in entries:
                 entry.hname = calculate_hname(entry.checksum, entry.size, entry.name)
 
@@ -378,5 +384,4 @@ def main():
         exit(1)
 
 if __name__ == '__main__':
-
     main()
