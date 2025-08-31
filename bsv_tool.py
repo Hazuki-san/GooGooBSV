@@ -243,13 +243,8 @@ class AnonymousSchemaBSVReader(BaseBSVReader):
         
         print(f"INFO: AnonymousSchema Reader initialized. Rows: {self.row_count}, Schema Columns: {self.schema_count}.")
 
-def init_bsv_reader(filepath: str) -> BaseBSVReader:
-    try:
-        with open(filepath, 'rb') as f_in:
-            buffer = lz4.frame.decompress(f_in.read())
-    except Exception as e:
-        raise IOError(f"Failed to decompress LZ4 file '{filepath}': {e}")
-        
+def _init_reader_from_buffer(buffer: bytes) -> BaseBSVReader:
+    """Internal helper to initialize a reader from a decompressed byte buffer."""
     if buffer[0] != 0xBF: raise ValueError("BSV magic mismatch")
     version, format_id = buffer[1] >> 4, buffer[1] & 0x0F
     if version != 1: raise ValueError("BSV version mismatch")
@@ -258,16 +253,34 @@ def init_bsv_reader(filepath: str) -> BaseBSVReader:
     if format_id == 1: return AnonymousSchemaBSVReader(buffer, 2)
     raise ValueError(f"BSV unsupported format: {format_id}")
 
+def init_bsv_reader(filepath: str) -> BaseBSVReader:
+    """Initializes a BSV reader from a file path."""
+    try:
+        with open(filepath, 'rb') as f_in:
+            buffer = lz4.frame.decompress(f_in.read())
+        return _init_reader_from_buffer(buffer)
+    except Exception as e:
+        raise IOError(f"Failed to read or decompress LZ4 file '{filepath}': {e}")
+
 # ==============================================================================
 # 6. High-Level API & Main Logic
 # ==============================================================================
 
-def read_manifest(filepath: str, format_type: str = 'auto') -> List[ManifestEntry]:
+def read_manifest(source: str | bytes, format_type: str = 'auto') -> List[ManifestEntry]:
     """
-    High-level function to read a manifest. If format_type is 'auto', it will
-    inspect the BSV header to determine the correct parser to use.
+    High-level function to read a manifest from a file path (str) or
+    from in-memory compressed bytes.
     """
-    reader = init_bsv_reader(filepath)
+    reader: BaseBSVReader
+    if isinstance(source, str):
+        # If it's a string, treat it as a file path
+        reader = init_bsv_reader(source)
+    elif isinstance(source, bytes):
+        # If it's bytes, decompress it and initialize from the buffer
+        decompressed_buffer = lz4.frame.decompress(source)
+        reader = _init_reader_from_buffer(decompressed_buffer)
+    else:
+        raise TypeError("source must be a file path (str) or compressed bytes.")
     
     if format_type == 'auto':
         print("INFO: Auto-detecting format...")
